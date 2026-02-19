@@ -101,3 +101,24 @@ python -m esasrec.train \
 ```
 
 В этом режиме в логах будут `hr@1, hr@5, hr@10, ndcg@10, mrr`.
+
+
+## Реалистичный протокол из статьи (ML-20M)
+
+Этот режим включает:
+- глобальный time-based holdout по последним `--test-days` (по умолчанию 60) дням,
+- фильтрацию cold users/items из test,
+- LOO-валидацию внутри train,
+- метрики `NDCG@10` (per-user achievable IDCG) и `Coverage@10` с `filter_viewed`.
+
+```bash
+python -m esasrec.train \
+  --ratings-path /path/to/ml-20m/ratings.csv \
+  --workdir ./artifacts_realistic \
+  --device cuda \
+  --epochs 1 \
+  --batch-size 128 \
+  --amp \
+  --eval-protocol realistic \
+  --test-days 60
+```

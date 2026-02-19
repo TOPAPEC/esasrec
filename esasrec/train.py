@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from esasrec.data import ShiftedSequenceDataset, prepare_ml20m
+from esasrec.data import ShiftedSequenceDataset, prepare_ml20m, prepare_ml20m_realistic
 from esasrec.model import ESASRec, ModelConfig
 
 
@@ -157,6 +157,51 @@ def evaluate_s3rec_sampled(model: ESASRec, histories: list[list[int]], targets: 
     return compute_sampled_metrics(np.asarray(ranks, dtype=np.float64))
 
 
+
+
+@torch.no_grad()
+def evaluate_realistic_time_split(model: ESASRec, histories: list[list[int]], test_relevant_items: dict[int, set[int]], max_len: int, batch_size: int, device: torch.device, n_items: int, max_users: int | None = None) -> dict[str, float]:
+    model.eval()
+    users = list(sorted(test_relevant_items.keys()))
+    if max_users is not None:
+        users = users[:max_users]
+    item_w = model.item_emb.weight[1:]
+    unique_recs: set[int] = set()
+    ndcgs = []
+
+    for i in range(0, len(users), batch_size):
+        ub = users[i:i + batch_size]
+        x = torch.zeros((len(ub), max_len), dtype=torch.long, device=device)
+        for j, uid in enumerate(ub):
+            seq = histories[uid - 1][-max_len:]
+            x[j, -len(seq):] = torch.tensor(seq, device=device)
+
+        h = model.encode(x)
+        idx = (x.ne(0).sum(1) - 1).clamp_min(0)
+        u = h[torch.arange(h.size(0), device=device), idx]
+        logits = u @ item_w.t()
+        seen_mask = torch.zeros_like(logits, dtype=torch.bool)
+        for j, uid in enumerate(ub):
+            seen = torch.tensor(list(set(histories[uid - 1])), device=device) - 1
+            seen_mask[j, seen] = True
+        logits = logits.masked_fill(seen_mask, float('-inf'))
+        topk = torch.topk(logits, k=10, dim=1).indices + 1
+
+        for j, uid in enumerate(ub):
+            recs = topk[j].detach().cpu().numpy().tolist()
+            unique_recs.update(recs)
+            rel = test_relevant_items[uid]
+            dcg = 0.0
+            for rank, it in enumerate(recs, start=1):
+                if it in rel:
+                    dcg += 1.0 / np.log2(rank + 1.0)
+            ideal_len = min(len(rel), 10)
+            idcg = sum(1.0 / np.log2(r + 1.0) for r in range(1, ideal_len + 1))
+            ndcgs.append((dcg / idcg) if idcg > 0 else 0.0)
+
+    coverage = float(len(unique_recs) / max(n_items, 1))
+    return {"ndcg@10": float(np.mean(ndcgs) if ndcgs else 0.0), "coverage@10": coverage, "metrics_backend": "realistic_time_split"}
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--ratings-path", type=str, required=True)
@@ -178,8 +223,9 @@ def main() -> None:
     p.add_argument("--max-train-users", type=int, default=None)
     p.add_argument("--max-eval-users", type=int, default=None)
     p.add_argument("--log-every", type=int, default=100)
-    p.add_argument("--eval-protocol", type=str, default="full", choices=["full", "s3rec"])
+    p.add_argument("--eval-protocol", type=str, default="realistic", choices=["full", "s3rec", "realistic"])
     p.add_argument("--eval-sampled-negatives", type=int, default=100)
+    p.add_argument("--test-days", type=int, default=60)
     args = p.parse_args()
 
     set_seed(args.seed)
@@ -187,7 +233,10 @@ def main() -> None:
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
-    prep = prepare_ml20m(args.ratings_path, max_users=args.max_train_users)
+    if args.eval_protocol == "realistic":
+        prep = prepare_ml20m_realistic(args.ratings_path, test_days=args.test_days, max_users=args.max_train_users)
+    else:
+        prep = prepare_ml20m(args.ratings_path, max_users=args.max_train_users)
     ds = ShiftedSequenceDataset(prep.train_sequences, args.max_len)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=device.type == "cuda", persistent_workers=args.num_workers > 0)
 
@@ -251,13 +300,17 @@ def main() -> None:
     if len(loss_checkpoints) >= 2:
         loss_trend_ok = loss_checkpoints[-1][1] <= loss_checkpoints[0][1]
     print(f"loss_trend_ok={int(loss_trend_ok)} checkpoints={len(loss_checkpoints)}")
-    test_hist = [s + [prep.val_targets[i + 1]] for i, s in enumerate(prep.train_sequences)]
-    if args.eval_protocol == "s3rec":
-        test = evaluate_s3rec_sampled(model, test_hist, prep.test_targets, args.max_len, args.batch_size, device, prep.n_items, args.eval_sampled_negatives, args.max_eval_users, args.seed + 10_000)
-        print(f"test: hr@1={test['hr@1']:.4f} hr@5={test['hr@5']:.4f} hr@10={test['hr@10']:.4f} ndcg@10={test['ndcg@10']:.4f} mrr={test['mrr']:.4f}")
+    if args.eval_protocol == "realistic":
+        test = evaluate_realistic_time_split(model, prep.train_sequences, prep.test_relevant_items, args.max_len, args.batch_size, device, prep.n_items, args.max_eval_users)
+        print(f"test: ndcg@10={test['ndcg@10']:.4f} coverage@10={test['coverage@10']:.4f}")
     else:
-        test = evaluate_full_catalog(model, test_hist, prep.test_targets, args.max_len, args.batch_size, device, args.max_eval_users)
-        print(f"test: recall@10={test['recall@10']:.4f} ndcg@10={test['ndcg@10']:.4f}")
+        test_hist = [s + [prep.val_targets[i + 1]] for i, s in enumerate(prep.train_sequences)]
+        if args.eval_protocol == "s3rec":
+            test = evaluate_s3rec_sampled(model, test_hist, prep.test_targets, args.max_len, args.batch_size, device, prep.n_items, args.eval_sampled_negatives, args.max_eval_users, args.seed + 10_000)
+            print(f"test: hr@1={test['hr@1']:.4f} hr@5={test['hr@5']:.4f} hr@10={test['hr@10']:.4f} ndcg@10={test['ndcg@10']:.4f} mrr={test['mrr']:.4f}")
+        else:
+            test = evaluate_full_catalog(model, test_hist, prep.test_targets, args.max_len, args.batch_size, device, args.max_eval_users)
+            print(f"test: recall@10={test['recall@10']:.4f} ndcg@10={test['ndcg@10']:.4f}")
 
     report = {
         "config": vars(args),
