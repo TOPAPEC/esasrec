@@ -4,7 +4,7 @@
 - Shifted Sequence objective (как в SASRec)
 - LiGR-блоки (pre-norm + gated residual)
 - Sampled Softmax loss
-- Метрики: Recall@10, NDCG@10 (через torchmetrics retrieval backend, как в табличной части статьи для MovieLens)
+- Метрики: Recall@10, NDCG@10 (full-catalog) и apples-to-apples S3Rec-style sampled protocol: HR@{1,5,10}, NDCG@{5,10}, MRR
 
 ## Установка
 
@@ -82,3 +82,22 @@ python scripts/vast_run.py --api-key <VAST_API_KEY> --insecure-ssl --search-only
 ```bash
 python scripts/vast_run.py --api-key <VAST_API_KEY> --gpu-name RTX_5090
 ```
+
+
+## Apples-to-apples (S3Rec-style eval protocol)
+
+Для честного сравнения с common academic setup (leave-one-out + 100 sampled negatives) запусти:
+
+```bash
+python -m esasrec.train \
+  --ratings-path /path/to/ml-20m/ratings.csv \
+  --workdir ./artifacts_s3rec_eval \
+  --device cuda \
+  --epochs 5 \
+  --batch-size 128 \
+  --amp \
+  --eval-protocol s3rec \
+  --eval-sampled-negatives 100
+```
+
+В этом режиме в логах будут `hr@1, hr@5, hr@10, ndcg@10, mrr`.

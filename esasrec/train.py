@@ -8,11 +8,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-try:
-    from torchmetrics.retrieval import RetrievalRecall, RetrievalNormalizedDCG
-except Exception:
-    RetrievalRecall = None
-    RetrievalNormalizedDCG = None
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -60,28 +55,35 @@ def sampled_softmax_loss(model: ESASRec, h: torch.Tensor, tgt: torch.Tensor, n_i
 
 
 def compute_topk_metrics(topk: torch.Tensor, targets: torch.Tensor, device: torch.device) -> dict[str, float]:
-    if RetrievalRecall is None or RetrievalNormalizedDCG is None:
-        hits = topk.eq(targets.unsqueeze(1))
-        recall = float(hits.any(dim=1).float().mean().item())
-        ndcg_vals = torch.zeros(topk.size(0), dtype=torch.float32, device=device)
-        hit_pos = hits.float().argmax(dim=1)
-        has_hit = hits.any(dim=1)
-        ndcg_vals[has_hit] = 1.0 / torch.log2(hit_pos[has_hit].float() + 2.0)
-        ndcg = float(ndcg_vals.mean().item())
-        return {"recall@10": recall, "ndcg@10": ndcg, "metrics_backend": "manual_fallback"}
+    hits = topk.eq(targets.unsqueeze(1))
+    recall = float(hits.any(dim=1).float().mean().item())
+    ndcg_vals = torch.zeros(topk.size(0), dtype=torch.float32, device=device)
+    hit_pos = hits.float().argmax(dim=1)
+    has_hit = hits.any(dim=1)
+    ndcg_vals[has_hit] = 1.0 / torch.log2(hit_pos[has_hit].float() + 2.0)
+    ndcg = float(ndcg_vals.mean().item())
+    return {"recall@10": recall, "ndcg@10": ndcg, "metrics_backend": "full_catalog"}
 
-    n_users, k = topk.shape
-    indexes = torch.arange(n_users, device=device).repeat_interleave(k)
-    preds = torch.arange(k, 0, -1, dtype=torch.float32, device=device).repeat(n_users)
-    target = topk.eq(targets.unsqueeze(1)).reshape(-1).int()
-    recall_metric = RetrievalRecall(top_k=k).to(device)
-    ndcg_metric = RetrievalNormalizedDCG(top_k=k).to(device)
-    recall = float(recall_metric(preds, target, indexes=indexes).item())
-    ndcg = float(ndcg_metric(preds, target, indexes=indexes).item())
-    return {"recall@10": recall, "ndcg@10": ndcg, "metrics_backend": "torchmetrics"}
+
+def compute_sampled_metrics(ranks: np.ndarray) -> dict[str, float]:
+    hr1 = float(np.mean(ranks <= 1))
+    hr5 = float(np.mean(ranks <= 5))
+    hr10 = float(np.mean(ranks <= 10))
+    ndcg5 = float(np.mean(np.where(ranks <= 5, 1.0 / np.log2(ranks + 1.0), 0.0)))
+    ndcg10 = float(np.mean(np.where(ranks <= 10, 1.0 / np.log2(ranks + 1.0), 0.0)))
+    mrr = float(np.mean(1.0 / ranks))
+    return {
+        "hr@1": hr1,
+        "hr@5": hr5,
+        "hr@10": hr10,
+        "ndcg@5": ndcg5,
+        "ndcg@10": ndcg10,
+        "mrr": mrr,
+        "metrics_backend": "s3rec_sampled_100n" if len(ranks) > 0 else "s3rec_sampled",
+    }
 
 @torch.no_grad()
-def evaluate(model: ESASRec, histories: list[list[int]], targets: dict[int, int], max_len: int, batch_size: int, device: torch.device, max_users: int | None = None) -> dict[str, float]:
+def evaluate_full_catalog(model: ESASRec, histories: list[list[int]], targets: dict[int, int], max_len: int, batch_size: int, device: torch.device, max_users: int | None = None) -> dict[str, float]:
     model.eval()
     users = list(range(1, len(histories) + 1))
     if max_users is not None:
@@ -102,8 +104,7 @@ def evaluate(model: ESASRec, histories: list[list[int]], targets: dict[int, int]
         logits = u @ item_w.t()
         seen_mask = torch.zeros_like(logits, dtype=torch.bool)
         for j, uid in enumerate(ub):
-            seen = set(histories[uid - 1])
-            seen = torch.tensor(list(seen), device=device) - 1
+            seen = torch.tensor(list(set(histories[uid - 1])), device=device) - 1
             seen_mask[j, seen] = True
         logits = logits.masked_fill(seen_mask, float('-inf'))
         topk = torch.topk(logits, k=10, dim=1).indices + 1
@@ -113,6 +114,47 @@ def evaluate(model: ESASRec, histories: list[list[int]], targets: dict[int, int]
     topk_all = torch.cat(all_topk, dim=0)
     targets_all = torch.cat(all_targets, dim=0)
     return compute_topk_metrics(topk_all, targets_all, device)
+
+
+@torch.no_grad()
+def evaluate_s3rec_sampled(model: ESASRec, histories: list[list[int]], targets: dict[int, int], max_len: int, batch_size: int, device: torch.device, n_items: int, n_sampled_negatives: int = 100, max_users: int | None = None, seed: int = 42) -> dict[str, float]:
+    model.eval()
+    rng = np.random.default_rng(seed)
+    users = list(range(1, len(histories) + 1))
+    if max_users is not None:
+        users = users[:max_users]
+    item_w = model.item_emb.weight
+    ranks: list[int] = []
+
+    for i in range(0, len(users), batch_size):
+        ub = users[i:i + batch_size]
+        x = torch.zeros((len(ub), max_len), dtype=torch.long, device=device)
+        cands = torch.zeros((len(ub), n_sampled_negatives + 1), dtype=torch.long, device=device)
+        for j, uid in enumerate(ub):
+            seq = histories[uid - 1][-max_len:]
+            x[j, -len(seq):] = torch.tensor(seq, device=device)
+            gt = int(targets[uid])
+            seen = set(histories[uid - 1])
+            seen.add(gt)
+            negs = []
+            while len(negs) < n_sampled_negatives:
+                cand = int(rng.integers(1, n_items + 1))
+                if cand not in seen:
+                    negs.append(cand)
+                    seen.add(cand)
+            cand_list = [gt] + negs
+            cands[j] = torch.tensor(cand_list, dtype=torch.long, device=device)
+
+        h = model.encode(x)
+        idx = (x.ne(0).sum(1) - 1).clamp_min(0)
+        u = h[torch.arange(h.size(0), device=device), idx]
+        cand_emb = item_w[cands]
+        scores = torch.einsum('bd,bkd->bk', u, cand_emb)
+        order = torch.argsort(scores, dim=1, descending=True)
+        pos = (order == 0).nonzero(as_tuple=False)[:, 1] + 1
+        ranks.extend(pos.detach().cpu().tolist())
+
+    return compute_sampled_metrics(np.asarray(ranks, dtype=np.float64))
 
 
 def main() -> None:
@@ -136,6 +178,8 @@ def main() -> None:
     p.add_argument("--max-train-users", type=int, default=None)
     p.add_argument("--max-eval-users", type=int, default=None)
     p.add_argument("--log-every", type=int, default=100)
+    p.add_argument("--eval-protocol", type=str, default="full", choices=["full", "s3rec"])
+    p.add_argument("--eval-sampled-negatives", type=int, default=100)
     args = p.parse_args()
 
     set_seed(args.seed)
@@ -189,9 +233,15 @@ def main() -> None:
         print(f"epoch_done {ep} loss_mean={float(np.mean(losses)):.6f}")
 
         val_hist = prep.train_sequences
-        val = evaluate(model, val_hist, prep.val_targets, args.max_len, args.batch_size, device, args.max_eval_users)
-        print(f"val: recall@10={val['recall@10']:.4f} ndcg@10={val['ndcg@10']:.4f}")
-        if val["ndcg@10"] > best_val:
+        if args.eval_protocol == "s3rec":
+            val = evaluate_s3rec_sampled(model, val_hist, prep.val_targets, args.max_len, args.batch_size, device, prep.n_items, args.eval_sampled_negatives, args.max_eval_users, args.seed + ep)
+            print(f"val: hr@10={val['hr@10']:.4f} ndcg@10={val['ndcg@10']:.4f} mrr={val['mrr']:.4f}")
+            val_key = val["ndcg@10"]
+        else:
+            val = evaluate_full_catalog(model, val_hist, prep.val_targets, args.max_len, args.batch_size, device, args.max_eval_users)
+            print(f"val: recall@10={val['recall@10']:.4f} ndcg@10={val['ndcg@10']:.4f}")
+            val_key = val["ndcg@10"]
+        if val_key > best_val:
             best_val = val["ndcg@10"]
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
 
@@ -202,13 +252,17 @@ def main() -> None:
         loss_trend_ok = loss_checkpoints[-1][1] <= loss_checkpoints[0][1]
     print(f"loss_trend_ok={int(loss_trend_ok)} checkpoints={len(loss_checkpoints)}")
     test_hist = [s + [prep.val_targets[i + 1]] for i, s in enumerate(prep.train_sequences)]
-    test = evaluate(model, test_hist, prep.test_targets, args.max_len, args.batch_size, device, args.max_eval_users)
-    print(f"test: recall@10={test['recall@10']:.4f} ndcg@10={test['ndcg@10']:.4f}")
+    if args.eval_protocol == "s3rec":
+        test = evaluate_s3rec_sampled(model, test_hist, prep.test_targets, args.max_len, args.batch_size, device, prep.n_items, args.eval_sampled_negatives, args.max_eval_users, args.seed + 10_000)
+        print(f"test: hr@1={test['hr@1']:.4f} hr@5={test['hr@5']:.4f} hr@10={test['hr@10']:.4f} ndcg@10={test['ndcg@10']:.4f} mrr={test['mrr']:.4f}")
+    else:
+        test = evaluate_full_catalog(model, test_hist, prep.test_targets, args.max_len, args.batch_size, device, args.max_eval_users)
+        print(f"test: recall@10={test['recall@10']:.4f} ndcg@10={test['ndcg@10']:.4f}")
 
     report = {
         "config": vars(args),
         "model": asdict(cfg),
-        "test_metrics": {"recall@10": test["recall@10"], "ndcg@10": test["ndcg@10"]},
+        "test_metrics": {k: float(v) for k, v in test.items() if k != "metrics_backend"},
         "metrics_backend": test.get("metrics_backend", "unknown"),
         "article_reference": ART_METRICS,
         "loss_checkpoints": [{"step": s, "mean_last": v} for s, v in loss_checkpoints],
