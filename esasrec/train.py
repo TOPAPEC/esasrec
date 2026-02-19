@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+import wandb
 
 from esasrec.data import ShiftedSequenceDataset, prepare_ml20m, prepare_ml20m_realistic
 from esasrec.model import ESASRec, ModelConfig
@@ -23,6 +23,13 @@ ART_METRICS = {
 }
 
 
+def _safe_gpu_utilization(device: torch.device) -> float | None:
+    try:
+        return float(torch.cuda.utilization(device=device))
+    except Exception:
+        return None
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -30,7 +37,9 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def sampled_softmax_loss(model: ESASRec, h: torch.Tensor, tgt: torch.Tensor, n_items: int, n_neg: int) -> torch.Tensor:
+def sampled_softmax_loss(
+    model: ESASRec, h: torch.Tensor, tgt: torch.Tensor, n_items: int, n_neg: int
+) -> torch.Tensor:
     m = tgt > 0
     if not torch.any(m):
         return h.new_zeros(())
@@ -43,7 +52,9 @@ def sampled_softmax_loss(model: ESASRec, h: torch.Tensor, tgt: torch.Tensor, n_i
     neg = torch.randint(1, n_items + 1, (h.size(0), n_neg), device=h.device)
     clash = neg.eq(pos.unsqueeze(1))
     while clash.any():
-        neg[clash] = torch.randint(1, n_items + 1, (int(clash.sum().item()),), device=h.device)
+        neg[clash] = torch.randint(
+            1, n_items + 1, (int(clash.sum().item()),), device=h.device
+        )
         clash = neg.eq(pos.unsqueeze(1))
     neg_e = model.item_emb(neg).float()
     neg_logits = torch.einsum("bd,bnd->bn", h, neg_e)
@@ -52,9 +63,9 @@ def sampled_softmax_loss(model: ESASRec, h: torch.Tensor, tgt: torch.Tensor, n_i
     return F.cross_entropy(logits, labels)
 
 
-
-
-def compute_topk_metrics(topk: torch.Tensor, targets: torch.Tensor, device: torch.device) -> dict[str, float]:
+def compute_topk_metrics(
+    topk: torch.Tensor, targets: torch.Tensor, device: torch.device
+) -> dict[str, float]:
     hits = topk.eq(targets.unsqueeze(1))
     recall = float(hits.any(dim=1).float().mean().item())
     ndcg_vals = torch.zeros(topk.size(0), dtype=torch.float32, device=device)
@@ -82,8 +93,17 @@ def compute_sampled_metrics(ranks: np.ndarray) -> dict[str, float]:
         "metrics_backend": "s3rec_sampled_100n" if len(ranks) > 0 else "s3rec_sampled",
     }
 
+
 @torch.no_grad()
-def evaluate_full_catalog(model: ESASRec, histories: list[list[int]], targets: dict[int, int], max_len: int, batch_size: int, device: torch.device, max_users: int | None = None) -> dict[str, float]:
+def evaluate_full_catalog(
+    model: ESASRec,
+    histories: list[list[int]],
+    targets: dict[int, int],
+    max_len: int,
+    batch_size: int,
+    device: torch.device,
+    max_users: int | None = None,
+) -> dict[str, float]:
     model.eval()
     users = list(range(1, len(histories) + 1))
     if max_users is not None:
@@ -92,11 +112,11 @@ def evaluate_full_catalog(model: ESASRec, histories: list[list[int]], targets: d
     all_topk, all_targets = [], []
 
     for i in range(0, len(users), batch_size):
-        ub = users[i:i + batch_size]
+        ub = users[i : i + batch_size]
         x = torch.zeros((len(ub), max_len), dtype=torch.long, device=device)
         for j, uid in enumerate(ub):
             seq = histories[uid - 1][-max_len:]
-            x[j, -len(seq):] = torch.tensor(seq, device=device)
+            x[j, -len(seq) :] = torch.tensor(seq, device=device)
 
         h = model.encode(x)
         idx = (x.ne(0).sum(1) - 1).clamp_min(0)
@@ -106,7 +126,7 @@ def evaluate_full_catalog(model: ESASRec, histories: list[list[int]], targets: d
         for j, uid in enumerate(ub):
             seen = torch.tensor(list(set(histories[uid - 1])), device=device) - 1
             seen_mask[j, seen] = True
-        logits = logits.masked_fill(seen_mask, float('-inf'))
+        logits = logits.masked_fill(seen_mask, float("-inf"))
         topk = torch.topk(logits, k=10, dim=1).indices + 1
         all_topk.append(topk)
         all_targets.append(torch.tensor([targets[uid] for uid in ub], device=device))
@@ -117,7 +137,18 @@ def evaluate_full_catalog(model: ESASRec, histories: list[list[int]], targets: d
 
 
 @torch.no_grad()
-def evaluate_s3rec_sampled(model: ESASRec, histories: list[list[int]], targets: dict[int, int], max_len: int, batch_size: int, device: torch.device, n_items: int, n_sampled_negatives: int = 100, max_users: int | None = None, seed: int = 42) -> dict[str, float]:
+def evaluate_s3rec_sampled(
+    model: ESASRec,
+    histories: list[list[int]],
+    targets: dict[int, int],
+    max_len: int,
+    batch_size: int,
+    device: torch.device,
+    n_items: int,
+    n_sampled_negatives: int = 100,
+    max_users: int | None = None,
+    seed: int = 42,
+) -> dict[str, float]:
     model.eval()
     rng = np.random.default_rng(seed)
     users = list(range(1, len(histories) + 1))
@@ -127,12 +158,14 @@ def evaluate_s3rec_sampled(model: ESASRec, histories: list[list[int]], targets: 
     ranks: list[int] = []
 
     for i in range(0, len(users), batch_size):
-        ub = users[i:i + batch_size]
+        ub = users[i : i + batch_size]
         x = torch.zeros((len(ub), max_len), dtype=torch.long, device=device)
-        cands = torch.zeros((len(ub), n_sampled_negatives + 1), dtype=torch.long, device=device)
+        cands = torch.zeros(
+            (len(ub), n_sampled_negatives + 1), dtype=torch.long, device=device
+        )
         for j, uid in enumerate(ub):
             seq = histories[uid - 1][-max_len:]
-            x[j, -len(seq):] = torch.tensor(seq, device=device)
+            x[j, -len(seq) :] = torch.tensor(seq, device=device)
             gt = int(targets[uid])
             seen = set(histories[uid - 1])
             seen.add(gt)
@@ -149,7 +182,7 @@ def evaluate_s3rec_sampled(model: ESASRec, histories: list[list[int]], targets: 
         idx = (x.ne(0).sum(1) - 1).clamp_min(0)
         u = h[torch.arange(h.size(0), device=device), idx]
         cand_emb = item_w[cands]
-        scores = torch.einsum('bd,bkd->bk', u, cand_emb)
+        scores = torch.einsum("bd,bkd->bk", u, cand_emb)
         order = torch.argsort(scores, dim=1, descending=True)
         pos = (order == 0).nonzero(as_tuple=False)[:, 1] + 1
         ranks.extend(pos.detach().cpu().tolist())
@@ -157,10 +190,17 @@ def evaluate_s3rec_sampled(model: ESASRec, histories: list[list[int]], targets: 
     return compute_sampled_metrics(np.asarray(ranks, dtype=np.float64))
 
 
-
-
 @torch.no_grad()
-def evaluate_realistic_time_split(model: ESASRec, histories: list[list[int]], test_relevant_items: dict[int, set[int]], max_len: int, batch_size: int, device: torch.device, n_items: int, max_users: int | None = None) -> dict[str, float]:
+def evaluate_realistic_time_split(
+    model: ESASRec,
+    histories: list[list[int]],
+    test_relevant_items: dict[int, set[int]],
+    max_len: int,
+    batch_size: int,
+    device: torch.device,
+    n_items: int,
+    max_users: int | None = None,
+) -> dict[str, float]:
     model.eval()
     users = list(sorted(test_relevant_items.keys()))
     if max_users is not None:
@@ -170,11 +210,11 @@ def evaluate_realistic_time_split(model: ESASRec, histories: list[list[int]], te
     ndcgs = []
 
     for i in range(0, len(users), batch_size):
-        ub = users[i:i + batch_size]
+        ub = users[i : i + batch_size]
         x = torch.zeros((len(ub), max_len), dtype=torch.long, device=device)
         for j, uid in enumerate(ub):
             seq = histories[uid - 1][-max_len:]
-            x[j, -len(seq):] = torch.tensor(seq, device=device)
+            x[j, -len(seq) :] = torch.tensor(seq, device=device)
 
         h = model.encode(x)
         idx = (x.ne(0).sum(1) - 1).clamp_min(0)
@@ -184,7 +224,7 @@ def evaluate_realistic_time_split(model: ESASRec, histories: list[list[int]], te
         for j, uid in enumerate(ub):
             seen = torch.tensor(list(set(histories[uid - 1])), device=device) - 1
             seen_mask[j, seen] = True
-        logits = logits.masked_fill(seen_mask, float('-inf'))
+        logits = logits.masked_fill(seen_mask, float("-inf"))
         topk = torch.topk(logits, k=10, dim=1).indices + 1
 
         for j, uid in enumerate(ub):
@@ -200,13 +240,70 @@ def evaluate_realistic_time_split(model: ESASRec, histories: list[list[int]], te
             ndcgs.append((dcg / idcg) if idcg > 0 else 0.0)
 
     coverage = float(len(unique_recs) / max(n_items, 1))
-    return {"ndcg@10": float(np.mean(ndcgs) if ndcgs else 0.0), "coverage@10": coverage, "metrics_backend": "realistic_time_split"}
+    return {
+        "ndcg@10": float(np.mean(ndcgs) if ndcgs else 0.0),
+        "coverage@10": coverage,
+        "metrics_backend": "realistic_time_split",
+    }
+
+
+@torch.no_grad()
+def evaluate_test_by_protocol(
+    model: ESASRec,
+    prep,
+    eval_protocol: str,
+    max_len: int,
+    batch_size: int,
+    device: torch.device,
+    max_eval_users: int | None,
+    eval_sampled_negatives: int,
+    seed: int,
+) -> dict[str, float]:
+    if eval_protocol == "realistic":
+        return evaluate_realistic_time_split(
+            model,
+            prep.train_sequences,
+            prep.test_relevant_items,
+            max_len,
+            batch_size,
+            device,
+            prep.n_items,
+            max_eval_users,
+        )
+    test_hist = [
+        s + [prep.val_targets[i + 1]] for i, s in enumerate(prep.train_sequences)
+    ]
+    if eval_protocol == "s3rec":
+        return evaluate_s3rec_sampled(
+            model,
+            test_hist,
+            prep.test_targets,
+            max_len,
+            batch_size,
+            device,
+            prep.n_items,
+            eval_sampled_negatives,
+            max_eval_users,
+            seed,
+        )
+    return evaluate_full_catalog(
+        model,
+        test_hist,
+        prep.test_targets,
+        max_len,
+        batch_size,
+        device,
+        max_eval_users,
+    )
+
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--ratings-path", type=str, required=True)
     p.add_argument("--workdir", type=str, default="./artifacts")
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-len", type=int, default=200)
     p.add_argument("--emb-dim", type=int, default=256)
@@ -223,9 +320,19 @@ def main() -> None:
     p.add_argument("--max-train-users", type=int, default=None)
     p.add_argument("--max-eval-users", type=int, default=None)
     p.add_argument("--log-every", type=int, default=100)
-    p.add_argument("--eval-protocol", type=str, default="realistic", choices=["full", "s3rec", "realistic"])
+    p.add_argument(
+        "--eval-protocol",
+        type=str,
+        default="realistic",
+        choices=["full", "s3rec", "realistic"],
+    )
     p.add_argument("--eval-sampled-negatives", type=int, default=100)
     p.add_argument("--test-days", type=int, default=60)
+    p.add_argument("--test-every", type=int, default=0)
+    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--wandb-project", type=str, default="esasrec")
+    p.add_argument("--wandb-entity", type=str, default=None)
+    p.add_argument("--wandb-run-name", type=str, default=None)
     args = p.parse_args()
 
     set_seed(args.seed)
@@ -234,16 +341,42 @@ def main() -> None:
     workdir.mkdir(parents=True, exist_ok=True)
 
     if args.eval_protocol == "realistic":
-        prep = prepare_ml20m_realistic(args.ratings_path, test_days=args.test_days, max_users=args.max_train_users)
+        prep = prepare_ml20m_realistic(
+            args.ratings_path, test_days=args.test_days, max_users=args.max_train_users
+        )
     else:
         prep = prepare_ml20m(args.ratings_path, max_users=args.max_train_users)
     ds = ShiftedSequenceDataset(prep.train_sequences, args.max_len)
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=device.type == "cuda", persistent_workers=args.num_workers > 0)
+    dl = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+    )
 
-    cfg = ModelConfig(n_items=prep.n_items, max_len=args.max_len, emb_dim=args.emb_dim, n_heads=args.n_heads, n_blocks=args.n_blocks, dropout=args.dropout, ff_mult=args.ff_mult)
+    cfg = ModelConfig(
+        n_items=prep.n_items,
+        max_len=args.max_len,
+        emb_dim=args.emb_dim,
+        n_heads=args.n_heads,
+        n_blocks=args.n_blocks,
+        dropout=args.dropout,
+        ff_mult=args.ff_mult,
+    )
     model = ESASRec(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
+
+    wb_run = None
+    if args.wandb:
+        wb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            config={**vars(args), "model": asdict(cfg)},
+        )
 
     best_val = -1.0
     best_state = None
@@ -252,9 +385,11 @@ def main() -> None:
     loss_checkpoints = []
     for ep in range(1, args.epochs + 1):
         model.train()
-        bar = tqdm(dl, desc=f"epoch {ep}/{args.epochs}")
         losses = []
-        for x, y in bar:
+        n_batches = len(dl)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        for it, (x, y) in enumerate(dl, start=1):
             global_step += 1
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -272,10 +407,31 @@ def main() -> None:
             loss_val = float(loss.item())
             losses.append(loss_val)
             if global_step % args.log_every == 0:
-                recent = float(np.mean(losses[-args.log_every:]))
+                recent = float(np.mean(losses[-args.log_every :]))
                 loss_checkpoints.append((global_step, recent))
                 print(f"loss_check step={global_step} mean_last={recent:.6f} finite=1")
-            bar.set_postfix(loss=f"{np.mean(losses):.4f}")
+            if wb_run is not None:
+                wb_payload = {
+                    "train/loss": loss_val,
+                    "train/loss_mean": float(np.mean(losses)),
+                    "train/epoch": ep,
+                    "train/iter": it,
+                }
+                if device.type == "cuda":
+                    wb_payload["system/gpu_mem_alloc_gb"] = float(
+                        torch.cuda.memory_allocated(device) / (1024**3)
+                    )
+                    wb_payload["system/gpu_mem_reserved_gb"] = float(
+                        torch.cuda.memory_reserved(device) / (1024**3)
+                    )
+                    gpu_util = _safe_gpu_utilization(device)
+                    if gpu_util is not None:
+                        wb_payload["system/gpu_util_pct"] = gpu_util
+                wandb.log(wb_payload, step=global_step)
+            if it % 100 == 0 or it == n_batches:
+                print(
+                    f"epoch {ep}/{args.epochs} iter {it}/{n_batches} loss_mean={float(np.mean(losses)):.4f}"
+                )
 
         if not losses:
             raise RuntimeError("all training batches produced non-finite loss")
@@ -283,16 +439,80 @@ def main() -> None:
 
         val_hist = prep.train_sequences
         if args.eval_protocol == "s3rec":
-            val = evaluate_s3rec_sampled(model, val_hist, prep.val_targets, args.max_len, args.batch_size, device, prep.n_items, args.eval_sampled_negatives, args.max_eval_users, args.seed + ep)
-            print(f"val: hr@10={val['hr@10']:.4f} ndcg@10={val['ndcg@10']:.4f} mrr={val['mrr']:.4f}")
+            val = evaluate_s3rec_sampled(
+                model,
+                val_hist,
+                prep.val_targets,
+                args.max_len,
+                args.batch_size,
+                device,
+                prep.n_items,
+                args.eval_sampled_negatives,
+                args.max_eval_users,
+                args.seed + ep,
+            )
+            print(
+                f"val: hr@10={val['hr@10']:.4f} ndcg@10={val['ndcg@10']:.4f} mrr={val['mrr']:.4f}"
+            )
             val_key = val["ndcg@10"]
         else:
-            val = evaluate_full_catalog(model, val_hist, prep.val_targets, args.max_len, args.batch_size, device, args.max_eval_users)
+            val = evaluate_full_catalog(
+                model,
+                val_hist,
+                prep.val_targets,
+                args.max_len,
+                args.batch_size,
+                device,
+                args.max_eval_users,
+            )
             print(f"val: recall@10={val['recall@10']:.4f} ndcg@10={val['ndcg@10']:.4f}")
             val_key = val["ndcg@10"]
         if val_key > best_val:
             best_val = val["ndcg@10"]
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        if wb_run is not None:
+            wb_val = {
+                f"val/{k}": float(v) for k, v in val.items() if k != "metrics_backend"
+            }
+            wb_val["val/epoch"] = ep
+            wb_val["train/epoch_loss_mean"] = float(np.mean(losses))
+            if device.type == "cuda":
+                wb_val["system/gpu_mem_peak_gb"] = float(
+                    torch.cuda.max_memory_allocated(device) / (1024**3)
+                )
+            wandb.log(wb_val, step=global_step)
+        if args.test_every > 0 and ep % args.test_every == 0:
+            periodic_test = evaluate_test_by_protocol(
+                model,
+                prep,
+                args.eval_protocol,
+                args.max_len,
+                args.batch_size,
+                device,
+                args.max_eval_users,
+                args.eval_sampled_negatives,
+                args.seed + 100_000 + ep,
+            )
+            if args.eval_protocol == "realistic":
+                print(
+                    f"test@ep{ep}: ndcg@10={periodic_test['ndcg@10']:.4f} coverage@10={periodic_test['coverage@10']:.4f}"
+                )
+            elif args.eval_protocol == "s3rec":
+                print(
+                    f"test@ep{ep}: hr@1={periodic_test['hr@1']:.4f} hr@5={periodic_test['hr@5']:.4f} hr@10={periodic_test['hr@10']:.4f} ndcg@10={periodic_test['ndcg@10']:.4f} mrr={periodic_test['mrr']:.4f}"
+                )
+            else:
+                print(
+                    f"test@ep{ep}: recall@10={periodic_test['recall@10']:.4f} ndcg@10={periodic_test['ndcg@10']:.4f}"
+                )
+            if wb_run is not None:
+                wb_test_periodic = {
+                    f"test_periodic/{k}": float(v)
+                    for k, v in periodic_test.items()
+                    if k != "metrics_backend"
+                }
+                wb_test_periodic["test_periodic/epoch"] = ep
+                wandb.log(wb_test_periodic, step=global_step)
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -300,27 +520,46 @@ def main() -> None:
     if len(loss_checkpoints) >= 2:
         loss_trend_ok = loss_checkpoints[-1][1] <= loss_checkpoints[0][1]
     print(f"loss_trend_ok={int(loss_trend_ok)} checkpoints={len(loss_checkpoints)}")
+    test = evaluate_test_by_protocol(
+        model,
+        prep,
+        args.eval_protocol,
+        args.max_len,
+        args.batch_size,
+        device,
+        args.max_eval_users,
+        args.eval_sampled_negatives,
+        args.seed + 10_000,
+    )
     if args.eval_protocol == "realistic":
-        test = evaluate_realistic_time_split(model, prep.train_sequences, prep.test_relevant_items, args.max_len, args.batch_size, device, prep.n_items, args.max_eval_users)
-        print(f"test: ndcg@10={test['ndcg@10']:.4f} coverage@10={test['coverage@10']:.4f}")
+        print(
+            f"test: ndcg@10={test['ndcg@10']:.4f} coverage@10={test['coverage@10']:.4f}"
+        )
+    elif args.eval_protocol == "s3rec":
+        print(
+            f"test: hr@1={test['hr@1']:.4f} hr@5={test['hr@5']:.4f} hr@10={test['hr@10']:.4f} ndcg@10={test['ndcg@10']:.4f} mrr={test['mrr']:.4f}"
+        )
     else:
-        test_hist = [s + [prep.val_targets[i + 1]] for i, s in enumerate(prep.train_sequences)]
-        if args.eval_protocol == "s3rec":
-            test = evaluate_s3rec_sampled(model, test_hist, prep.test_targets, args.max_len, args.batch_size, device, prep.n_items, args.eval_sampled_negatives, args.max_eval_users, args.seed + 10_000)
-            print(f"test: hr@1={test['hr@1']:.4f} hr@5={test['hr@5']:.4f} hr@10={test['hr@10']:.4f} ndcg@10={test['ndcg@10']:.4f} mrr={test['mrr']:.4f}")
-        else:
-            test = evaluate_full_catalog(model, test_hist, prep.test_targets, args.max_len, args.batch_size, device, args.max_eval_users)
-            print(f"test: recall@10={test['recall@10']:.4f} ndcg@10={test['ndcg@10']:.4f}")
+        print(f"test: recall@10={test['recall@10']:.4f} ndcg@10={test['ndcg@10']:.4f}")
 
     report = {
         "config": vars(args),
         "model": asdict(cfg),
-        "test_metrics": {k: float(v) for k, v in test.items() if k != "metrics_backend"},
+        "test_metrics": {
+            k: float(v) for k, v in test.items() if k != "metrics_backend"
+        },
         "metrics_backend": test.get("metrics_backend", "unknown"),
         "article_reference": ART_METRICS,
         "loss_checkpoints": [{"step": s, "mean_last": v} for s, v in loss_checkpoints],
         "loss_trend_ok": bool(loss_trend_ok),
     }
+    if wb_run is not None:
+        wb_test = {
+            f"test/{k}": float(v) for k, v in test.items() if k != "metrics_backend"
+        }
+        wb_test["train/loss_trend_ok"] = int(loss_trend_ok)
+        wandb.log(wb_test, step=global_step)
+        wb_run.finish()
     (workdir / "metrics.json").write_text(json.dumps(report, indent=2))
     torch.save(model.state_dict(), workdir / "esasrec.pt")
     print("train_finished")

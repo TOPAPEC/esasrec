@@ -1,2 +1,10 @@
 __pycache__/
 *.pyc
+
+.venv/
+artifacts_1ep_s3rec/
+artifacts_gpu/
+artifacts_realistic/
+data/
+.ipynb_checkpoints/
+wandb/

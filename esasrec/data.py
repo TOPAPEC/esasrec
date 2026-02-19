@@ -29,14 +29,23 @@ def _iterative_kcore(df: pd.DataFrame, min_user: int, min_item: int) -> pd.DataF
     while True:
         uc = df["userId"].value_counts()
         ic = df["movieId"].value_counts()
-        nxt = df[df["userId"].isin(uc[uc >= min_user].index) & df["movieId"].isin(ic[ic >= min_item].index)]
+        nxt = df[
+            df["userId"].isin(uc[uc >= min_user].index)
+            & df["movieId"].isin(ic[ic >= min_item].index)
+        ]
         if len(nxt) == len(df):
             return df
         df = nxt
 
 
-def prepare_ml20m(ratings_path: str, min_user: int = 5, min_item: int = 5, max_users: int | None = None) -> PreparedData:
-    df = pd.read_csv(ratings_path, usecols=["userId", "movieId", "timestamp"])
+def prepare_ml20m(
+    ratings_path: str,
+    min_user: int = 5,
+    min_item: int = 5,
+    max_users: int | None = None,
+) -> PreparedData:
+    df = pd.read_csv(ratings_path, usecols=["userId", "movieId", "rating", "timestamp"])
+    df = df[df["rating"] >= 0.0]
     df = _iterative_kcore(df, min_user=min_user, min_item=min_item)
     if max_users is not None:
         users = df["userId"].value_counts().index[:max_users]
@@ -64,7 +73,13 @@ def prepare_ml20m(ratings_path: str, min_user: int = 5, min_item: int = 5, max_u
         train_sequences.append(s[:-2])
         val_targets[uid] = s[-2]
         test_targets[uid] = s[-1]
-    return PreparedData(train_sequences, val_targets, test_targets, n_items=len(items), n_users=len(train_sequences))
+    return PreparedData(
+        train_sequences,
+        val_targets,
+        test_targets,
+        n_items=len(items),
+        n_users=len(train_sequences),
+    )
 
 
 def prepare_ml20m_realistic(
@@ -75,7 +90,8 @@ def prepare_ml20m_realistic(
     max_users: int | None = None,
     filter_train_pairs_from_test: bool = True,
 ) -> PreparedRealisticData:
-    df = pd.read_csv(ratings_path, usecols=["userId", "movieId", "timestamp"])
+    df = pd.read_csv(ratings_path, usecols=["userId", "movieId", "rating", "timestamp"])
+    df = df[df["rating"] >= 0.0]
     df = _iterative_kcore(df, min_user=min_user, min_item=min_item)
     if max_users is not None:
         users = df["userId"].value_counts().index[:max_users]
@@ -90,52 +106,53 @@ def prepare_ml20m_realistic(
 
     train_users = set(train_df["userId"].unique())
     train_items = set(train_df["movieId"].unique())
-    test_df = test_df[test_df["userId"].isin(train_users) & test_df["movieId"].isin(train_items)]
+    test_df = test_df[
+        test_df["userId"].isin(train_users) & test_df["movieId"].isin(train_items)
+    ]
     if filter_train_pairs_from_test:
         seen_pairs = set(zip(train_df["userId"], train_df["movieId"]))
-        mask = [(u, i) not in seen_pairs for u, i in zip(test_df["userId"], test_df["movieId"])]
+        mask = [
+            (u, i) not in seen_pairs
+            for u, i in zip(test_df["userId"], test_df["movieId"])
+        ]
         test_df = test_df[mask]
 
-    used_users = sorted(set(train_df["userId"]).intersection(set(test_df["userId"])))
-    train_df = train_df[train_df["userId"].isin(used_users)].copy()
-    test_df = test_df[test_df["userId"].isin(used_users)].copy()
-
+    train_users_sorted = sorted(train_df["userId"].unique())
     train_items_sorted = sorted(train_df["movieId"].unique())
-    u2i = {u: i + 1 for i, u in enumerate(used_users)}
+    u2i = {u: i + 1 for i, u in enumerate(train_users_sorted)}
     it2i = {it: i + 1 for i, it in enumerate(train_items_sorted)}
 
     train_df["uid"] = train_df["userId"].map(u2i)
     train_df["iid"] = train_df["movieId"].map(it2i)
     test_df["uid"] = test_df["userId"].map(u2i)
     test_df["iid"] = test_df["movieId"].map(it2i)
+    test_df = test_df.dropna(subset=["uid", "iid"])
 
     train_df = train_df.sort_values(["uid", "datetime", "orig_idx"])
     train_sequences_by_uid: dict[int, list[int]] = {}
     for row in train_df[["uid", "iid"]].itertuples(index=False):
         train_sequences_by_uid.setdefault(int(row.uid), []).append(int(row.iid))
 
-    val_targets: dict[int, int] = {}
-    train_sequences: list[list[int]] = []
-    uid_order = sorted(train_sequences_by_uid)
-    for uid in uid_order:
+    val_targets_raw: dict[int, int] = {}
+    train_sequences_by_uid_trunc: dict[int, list[int]] = {}
+    for uid in sorted(train_sequences_by_uid):
         seq = train_sequences_by_uid[uid]
-        if len(seq) < 2:
+        if len(seq) < 3:
             continue
-        val_targets[uid] = seq[-1]
-        train_sequences.append(seq[:-1])
+        val_targets_raw[uid] = seq[-1]
+        train_sequences_by_uid_trunc[uid] = seq[:-1]
 
-    valid_uids = set(val_targets.keys())
+    valid_uids = set(val_targets_raw.keys())
+    uid_order = sorted(valid_uids)
+    uid_remap = {uid: i + 1 for i, uid in enumerate(uid_order)}
+    train_sequences = [train_sequences_by_uid_trunc[uid] for uid in uid_order]
+    val_targets = {uid_remap[uid]: val_targets_raw[uid] for uid in uid_order}
+
     test_relevant_items: dict[int, set[int]] = {}
     for row in test_df[["uid", "iid"]].itertuples(index=False):
         uid = int(row.uid)
-        if uid in valid_uids:
-            test_relevant_items.setdefault(uid, set()).add(int(row.iid))
-
-    kept_uids = sorted(set(test_relevant_items).intersection(valid_uids))
-    uid_to_pos = {uid: i for i, uid in enumerate(uid_order)}
-    train_sequences = [train_sequences[uid_to_pos[uid]] for uid in kept_uids]
-    val_targets = {uid: val_targets[uid] for uid in kept_uids}
-    test_relevant_items = {uid: test_relevant_items[uid] for uid in kept_uids}
+        if uid in uid_remap:
+            test_relevant_items.setdefault(uid_remap[uid], set()).add(int(row.iid))
 
     return PreparedRealisticData(
         train_sequences=train_sequences,
@@ -151,7 +168,7 @@ class ShiftedSequenceDataset(Dataset):
         self.max_len = max_len
         self.data = []
         for s in train_sequences:
-            s = s[-(max_len + 1):]
+            s = s[-(max_len + 1) :]
             inp = s[:-1]
             tgt = s[1:]
             self.data.append((inp, tgt))
@@ -163,8 +180,8 @@ class ShiftedSequenceDataset(Dataset):
         inp, tgt = self.data[idx]
         x = np.zeros(self.max_len, dtype=np.int64)
         y = np.zeros(self.max_len, dtype=np.int64)
-        x[-len(inp):] = inp
-        y[-len(tgt):] = tgt
+        x[-len(inp) :] = inp
+        y[-len(tgt) :] = tgt
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
