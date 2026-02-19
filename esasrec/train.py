@@ -7,6 +7,12 @@ import random
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+try:
+    from torchmetrics.retrieval import RetrievalRecall, RetrievalNormalizedDCG
+except Exception:
+    RetrievalRecall = None
+    RetrievalNormalizedDCG = None
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -51,6 +57,29 @@ def sampled_softmax_loss(model: ESASRec, h: torch.Tensor, tgt: torch.Tensor, n_i
     return F.cross_entropy(logits, labels)
 
 
+
+
+def compute_topk_metrics(topk: torch.Tensor, targets: torch.Tensor, device: torch.device) -> dict[str, float]:
+    if RetrievalRecall is None or RetrievalNormalizedDCG is None:
+        hits = topk.eq(targets.unsqueeze(1))
+        recall = float(hits.any(dim=1).float().mean().item())
+        ndcg_vals = torch.zeros(topk.size(0), dtype=torch.float32, device=device)
+        hit_pos = hits.float().argmax(dim=1)
+        has_hit = hits.any(dim=1)
+        ndcg_vals[has_hit] = 1.0 / torch.log2(hit_pos[has_hit].float() + 2.0)
+        ndcg = float(ndcg_vals.mean().item())
+        return {"recall@10": recall, "ndcg@10": ndcg, "metrics_backend": "manual_fallback"}
+
+    n_users, k = topk.shape
+    indexes = torch.arange(n_users, device=device).repeat_interleave(k)
+    preds = torch.arange(k, 0, -1, dtype=torch.float32, device=device).repeat(n_users)
+    target = topk.eq(targets.unsqueeze(1)).reshape(-1).int()
+    recall_metric = RetrievalRecall(top_k=k).to(device)
+    ndcg_metric = RetrievalNormalizedDCG(top_k=k).to(device)
+    recall = float(recall_metric(preds, target, indexes=indexes).item())
+    ndcg = float(ndcg_metric(preds, target, indexes=indexes).item())
+    return {"recall@10": recall, "ndcg@10": ndcg, "metrics_backend": "torchmetrics"}
+
 @torch.no_grad()
 def evaluate(model: ESASRec, histories: list[list[int]], targets: dict[int, int], max_len: int, batch_size: int, device: torch.device, max_users: int | None = None) -> dict[str, float]:
     model.eval()
@@ -58,7 +87,7 @@ def evaluate(model: ESASRec, histories: list[list[int]], targets: dict[int, int]
     if max_users is not None:
         users = users[:max_users]
     item_w = model.item_emb.weight[1:]
-    recalls, ndcgs = [], []
+    all_topk, all_targets = [], []
 
     for i in range(0, len(users), batch_size):
         ub = users[i:i + batch_size]
@@ -78,20 +107,12 @@ def evaluate(model: ESASRec, histories: list[list[int]], targets: dict[int, int]
             seen_mask[j, seen] = True
         logits = logits.masked_fill(seen_mask, float('-inf'))
         topk = torch.topk(logits, k=10, dim=1).indices + 1
+        all_topk.append(topk)
+        all_targets.append(torch.tensor([targets[uid] for uid in ub], device=device))
 
-        for j, uid in enumerate(ub):
-            gt = targets[uid]
-            recs = topk[j]
-            hit = (recs == gt).nonzero(as_tuple=False)
-            if hit.numel() == 0:
-                recalls.append(0.0)
-                ndcgs.append(0.0)
-            else:
-                rank = int(hit[0].item())
-                recalls.append(1.0)
-                ndcgs.append(1.0 / np.log2(rank + 2))
-
-    return {"recall@10": float(np.mean(recalls)), "ndcg@10": float(np.mean(ndcgs))}
+    topk_all = torch.cat(all_topk, dim=0)
+    targets_all = torch.cat(all_targets, dim=0)
+    return compute_topk_metrics(topk_all, targets_all, device)
 
 
 def main() -> None:
@@ -187,7 +208,8 @@ def main() -> None:
     report = {
         "config": vars(args),
         "model": asdict(cfg),
-        "test_metrics": test,
+        "test_metrics": {"recall@10": test["recall@10"], "ndcg@10": test["ndcg@10"]},
+        "metrics_backend": test.get("metrics_backend", "unknown"),
         "article_reference": ART_METRICS,
         "loss_checkpoints": [{"step": s, "mean_last": v} for s, v in loss_checkpoints],
         "loss_trend_ok": bool(loss_trend_ok),

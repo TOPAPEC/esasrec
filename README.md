@@ -4,7 +4,7 @@
 - Shifted Sequence objective (как в SASRec)
 - LiGR-блоки (pre-norm + gated residual)
 - Sampled Softmax loss
-- Метрики: Recall@10, NDCG@10 (как в табличной части статьи для MovieLens)
+- Метрики: Recall@10, NDCG@10 (через torchmetrics retrieval backend, как в табличной части статьи для MovieLens)
 
 ## Установка
 
