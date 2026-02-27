@@ -1,0 +1,100 @@
+{
+  "config": {
+    "ratings_path": "/workspace/esasrec/data/ml-20m/ratings.csv",
+    "workdir": "./artifacts_1ep",
+    "device": "cuda",
+    "seed": 42,
+    "max_len": 200,
+    "emb_dim": 256,
+    "n_heads": 8,
+    "n_blocks": 4,
+    "dropout": 0.2,
+    "ff_mult": 4,
+    "n_neg": 256,
+    "batch_size": 128,
+    "epochs": 1,
+    "lr": 0.001,
+    "num_workers": 4,
+    "amp": true,
+    "max_train_users": null,
+    "max_eval_users": null,
+    "log_every": 100,
+    "eval_protocol": "realistic",
+    "eval_sampled_negatives": 100,
+    "test_days": 60,
+    "test_every": 0,
+    "wandb": false,
+    "wandb_project": "esasrec",
+    "wandb_entity": null,
+    "wandb_run_name": null
+  },
+  "model": {
+    "n_items": 18294,
+    "max_len": 200,
+    "emb_dim": 256,
+    "n_heads": 8,
+    "n_blocks": 4,
+    "dropout": 0.2,
+    "ff_mult": 4
+  },
+  "test_metrics": {
+    "ndcg@10": 0.08696205029981138,
+    "coverage@10": 0.09702634743631793
+  },
+  "metrics_backend": "realistic_time_split",
+  "article_reference": {
+    "ml20m_our_experiments": {
+      "sasrec_ss": {
+        "recall@10": 0.313,
+        "ndcg@10": 0.183
+      },
+      "esasrec": {
+        "recall@10": 0.329,
+        "ndcg@10": 0.197
+      }
+    }
+  },
+  "loss_checkpoints": [
+    {
+      "step": 100,
+      "mean_last": 3.5668083786964417
+    },
+    {
+      "step": 200,
+      "mean_last": 2.9086163091659545
+    },
+    {
+      "step": 300,
+      "mean_last": 2.522817938327789
+    },
+    {
+      "step": 400,
+      "mean_last": 2.2735818815231323
+    },
+    {
+      "step": 500,
+      "mean_last": 2.157490736246109
+    },
+    {
+      "step": 600,
+      "mean_last": 2.082243092060089
+    },
+    {
+      "step": 700,
+      "mean_last": 2.015374883413315
+    },
+    {
+      "step": 800,
+      "mean_last": 1.978816680908203
+    },
+    {
+      "step": 900,
+      "mean_last": 1.938996649980545
+    },
+    {
+      "step": 1000,
+      "mean_last": 1.9136031234264375
+    }
+  ],
+  "loss_trend_ok": true
+}

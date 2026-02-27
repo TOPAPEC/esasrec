@@ -8,3 +8,4 @@ artifacts_realistic/
 data/
 .ipynb_checkpoints/
 wandb/
+*.pt

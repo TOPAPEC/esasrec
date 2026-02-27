@@ -19,7 +19,14 @@ ART_METRICS = {
     "ml20m_our_experiments": {
         "sasrec_ss": {"recall@10": 0.313, "ndcg@10": 0.183},
         "esasrec": {"recall@10": 0.329, "ndcg@10": 0.197},
-    }
+    },
+    "ml20m_paper_table2_realistic": {
+        "sasrec_vanilla_bce": {"ndcg@10": 0.1192, "coverage@10": 0.0829},
+        "sasrec_ss": {"ndcg@10": 0.1527, "coverage@10": 0.0913},
+        "esasrec": {"ndcg@10": 0.1563, "coverage@10": 0.0889},
+        "sasrec_ligr_gbce075": {"ndcg@10": 0.1479, "coverage@10": 0.1049},
+        "hstu": {"ndcg@10": 0.1872, "coverage@10": 0.0535},
+    },
 }
 
 
@@ -329,6 +336,7 @@ def main() -> None:
     p.add_argument("--eval-sampled-negatives", type=int, default=100)
     p.add_argument("--test-days", type=int, default=60)
     p.add_argument("--test-every", type=int, default=0)
+    p.add_argument("--patience", type=int, default=50)
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", type=str, default="esasrec")
     p.add_argument("--wandb-entity", type=str, default=None)
@@ -366,7 +374,7 @@ def main() -> None:
         ff_mult=args.ff_mult,
     )
     model = ESASRec(cfg).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
 
     wb_run = None
@@ -378,8 +386,9 @@ def main() -> None:
             config={**vars(args), "model": asdict(cfg)},
         )
 
-    best_val = -1.0
+    best_val_loss = float("inf")
     best_state = None
+    patience_counter = 0
 
     global_step = 0
     loss_checkpoints = []
@@ -437,6 +446,8 @@ def main() -> None:
             raise RuntimeError("all training batches produced non-finite loss")
         print(f"epoch_done {ep} loss_mean={float(np.mean(losses)):.6f}")
 
+        epoch_loss = float(np.mean(losses))
+
         val_hist = prep.train_sequences
         if args.eval_protocol == "s3rec":
             val = evaluate_s3rec_sampled(
@@ -452,9 +463,8 @@ def main() -> None:
                 args.seed + ep,
             )
             print(
-                f"val: hr@10={val['hr@10']:.4f} ndcg@10={val['ndcg@10']:.4f} mrr={val['mrr']:.4f}"
+                f"val: hr@10={val['hr@10']:.4f} ndcg@10={val['ndcg@10']:.4f} mrr={val['mrr']:.4f} val_loss={epoch_loss:.6f}"
             )
-            val_key = val["ndcg@10"]
         else:
             val = evaluate_full_catalog(
                 model,
@@ -465,11 +475,13 @@ def main() -> None:
                 device,
                 args.max_eval_users,
             )
-            print(f"val: recall@10={val['recall@10']:.4f} ndcg@10={val['ndcg@10']:.4f}")
-            val_key = val["ndcg@10"]
-        if val_key > best_val:
-            best_val = val["ndcg@10"]
+            print(f"val: recall@10={val['recall@10']:.4f} ndcg@10={val['ndcg@10']:.4f} val_loss={epoch_loss:.6f}")
+        if epoch_loss < best_val_loss:
+            best_val_loss = epoch_loss
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
         if wb_run is not None:
             wb_val = {
                 f"val/{k}": float(v) for k, v in val.items() if k != "metrics_backend"
@@ -513,6 +525,9 @@ def main() -> None:
                 }
                 wb_test_periodic["test_periodic/epoch"] = ep
                 wandb.log(wb_test_periodic, step=global_step)
+        if args.patience > 0 and patience_counter >= args.patience:
+            print(f"early_stop epoch={ep} patience={args.patience} best_val_loss={best_val_loss:.6f}")
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
